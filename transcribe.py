@@ -21,47 +21,50 @@ import logging
 import resource
 import subprocess
 import sys
-import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import mlx_whisper
 
 
 # ---------------------------------------------------------------------------
-# Step timer — wall time, CPU time, CPU utilisation
+# Configuration
 # ---------------------------------------------------------------------------
 
-class StepTimer:
-    """Context manager that measures wall time and CPU time for a pipeline step."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.wall: float = 0.0
-        self.cpu: float = 0.0
-
-    def __enter__(self) -> "StepTimer":
-        self._wall_start = time.perf_counter()
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self._cpu_start = ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime
-        return self
-
-    def __exit__(self, *_) -> None:
-        self.wall = time.perf_counter() - self._wall_start
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self.cpu = (ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime) - self._cpu_start
+@dataclass
+class PipelineConfig:
+    """All settings for a single pipeline run."""
+    input: Path
+    model: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx"
+    language: str = "he"
+    output_dir: Path | None = None
+    speedup: float | None = None
+    chunk_duration: int = 180
+    force: bool = False
 
 
-def _fmt_dur(secs: float) -> str:
-    """Format a duration in seconds as a concise human-readable string."""
-    if secs < 60:
-        return f"{secs:.1f}s"
-    m, s = divmod(int(secs), 60)
-    return f"{m}m{s:02d}s"
+# ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
+
+class TranscribeBackend(Protocol):
+    """Anything that can transcribe an audio file into (start, end, text) segments."""
+    def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]: ...
 
 
-def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, model_repo: str) -> None:
+class MlxWhisperBackend:
+    """Transcription via mlx-whisper (Apple Silicon GPU/Neural Engine)."""
+
+    def __init__(self, model_repo: str) -> None:
+        self.model_repo = model_repo
+
+    def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]:
+        result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=self.model_repo, language=language)
+        return [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+
+
+def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, backend: TranscribeBackend) -> None:
     """
     Transcribe a single chunk and save the result to a JSON checkpoint file.
     Skips if the checkpoint already exists (resume support).
@@ -74,9 +77,7 @@ def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language:
 
     logging.info("[TRANSCRIBE] chunk_%03d — transcribing %s ...", chunk_idx, Path(chunk_path).name)
 
-    result = mlx_whisper.transcribe(chunk_path, path_or_hf_repo=model_repo, language=language)
-
-    segs = [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+    segs = backend.transcribe(chunk_path, language)
     out.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
 
     logging.info("[TRANSCRIBE] chunk_%03d — done (%d segments)", chunk_idx, len(segs))
@@ -174,12 +175,12 @@ def chunk_audio(
 def transcribe_chunks(
     chunk_paths: list[Path],
     chunks_dir: Path,
-    model_name: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
+    backend: TranscribeBackend,
     language: str = "he",
     force: bool = False,
 ) -> None:
     """
-    Transcribe all chunks using mlx-whisper (Apple Silicon GPU/Neural Engine).
+    Transcribe all chunks using the provided backend.
 
     Each completed chunk is saved to chunk_NNN.json immediately as a resume
     checkpoint. Skips chunks whose .json already exists (unless force=True).
@@ -205,45 +206,13 @@ def transcribe_chunks(
         logging.info("[TRANSCRIBE] All chunks already transcribed — skipping")
         return
 
-    # Pre-measure actual audio durations for accurate ETA (fast ffprobe metadata reads)
-    chunk_audio_durs = [_get_audio_duration(p) for p in chunk_paths]
-
-    remaining_audio = sum(
-        d for p, d in zip(chunk_paths, chunk_audio_durs)
-        if not (chunks_dir / f"{p.stem}.json").exists()
-    )
-    rough_est = remaining_audio / 10.0  # assume 10x RTF until we have real data
-    logging.info(
-        "[TRANSCRIBE] Audio to transcribe: %s | Rough estimate: ~%s (at 10x real-time)",
-        _fmt_dur(remaining_audio), _fmt_dur(rough_est),
-    )
-    logging.info("[TRANSCRIBE] Using model: %s", model_name)
+    logging.info("[TRANSCRIBE] Using backend: %s", type(backend).__name__)
 
     rtf_samples: list[float] = []  # audio_sec / process_sec per actually-transcribed chunk
 
     for idx, chunk_path in enumerate(chunk_paths):
         output_json = chunks_dir / f"{chunk_path.stem}.json"
-        was_done = output_json.exists()
-
-        t0 = time.perf_counter()
-        _transcribe_one(str(chunk_path), idx, str(output_json), language, model_name)
-        elapsed = time.perf_counter() - t0
-
-        if not was_done and elapsed > 0:
-            rtf_samples.append(chunk_audio_durs[idx] / elapsed)
-
-        # ETA: remaining audio / avg real-time factor
-        left_audio = sum(
-            chunk_audio_durs[j]
-            for j in range(idx + 1, len(chunk_paths))
-            if not (chunks_dir / f"{chunk_paths[j].stem}.json").exists()
-        )
-        if rtf_samples and left_audio > 0:
-            avg_rtf = sum(rtf_samples) / len(rtf_samples)
-            logging.info(
-                "[TRANSCRIBE] Progress: %d/%d | RTF %.1fx | ETA ~%s",
-                idx + 1, total, avg_rtf, _fmt_dur(left_audio / avg_rtf),
-            )
+        _transcribe_one(str(chunk_path), idx, str(output_json), language, backend)
 
     done_after = sum(1 for p in chunk_paths if (chunks_dir / f"{p.stem}.json").exists())
     logging.info("[TRANSCRIBE] Done — %d/%d chunks transcribed", done_after, total)
@@ -327,14 +296,17 @@ def merge_results(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = None) -> None:
     """Orchestrate all pipeline steps: extract → chunk → transcribe → merge."""
-    video_path = Path(args.input).resolve()
+    video_path = config.input.resolve()
     if not video_path.exists():
         logging.error("Input file not found: %s", video_path)
         sys.exit(1)
 
-    output_dir = Path(args.output_dir) if args.output_dir else video_path.parent / f"{video_path.stem}_output"
+    if backend is None:
+        backend = MlxWhisperBackend(config.model)
+
+    output_dir = config.output_dir or video_path.parent / f"{video_path.stem}_output"
     chunks_dir = output_dir / "chunks"
     output_dir.mkdir(parents=True, exist_ok=True)
     chunks_dir.mkdir(parents=True, exist_ok=True)
@@ -342,79 +314,42 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logging.info("=" * 60)
     logging.info("[PIPELINE] Input:        %s", video_path)
     logging.info("[PIPELINE] Output dir:   %s", output_dir)
-    logging.info("[PIPELINE] Model:        %s", args.model)
-    logging.info("[PIPELINE] Language:     %s", args.language)
-    logging.info("[PIPELINE] Chunk dur:    %ds", args.chunk_duration)
-    logging.info("[PIPELINE] Speedup:      %s", f"{args.speedup}x" if args.speedup else "disabled")
-    logging.info("[PIPELINE] Force re-run: %s", args.force)
+    logging.info("[PIPELINE] Model:        %s", config.model)
+    logging.info("[PIPELINE] Language:     %s", config.language)
+    logging.info("[PIPELINE] Chunk dur:    %ds", config.chunk_duration)
+    logging.info("[PIPELINE] Speedup:      %s", f"{config.speedup}x" if config.speedup else "disabled")
+    logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
 
     timers: list[StepTimer] = []
 
     # Step 1: Extract audio
-    with StepTimer("extract_audio") as t:
-        audio_path = extract_audio(
-            video_path, output_dir,
-            speedup=args.speedup,
-            force=args.force,
-        )
-    timers.append(t)
+    audio_path = extract_audio(
+        video_path, output_dir,
+        speedup=config.speedup,
+        force=config.force,
+    )
 
     # Step 2: Chunk audio
-    with StepTimer("chunk_audio") as t:
-        chunk_paths = chunk_audio(
-            audio_path, chunks_dir,
-            chunk_duration=args.chunk_duration,
-            force=args.force,
-        )
-    timers.append(t)
+    chunk_paths = chunk_audio(
+        audio_path, chunks_dir,
+        chunk_duration=config.chunk_duration,
+        force=config.force,
+    )
     if not chunk_paths:
         logging.error("[PIPELINE] No chunks produced — aborting")
         sys.exit(1)
 
     # Step 3: Transcribe chunks
-    with StepTimer("transcribe") as t:
-        transcribe_chunks(
-            chunk_paths, chunks_dir,
-            model_name=args.model,
-            language=args.language,
-            force=args.force,
-        )
-    timers.append(t)
+    transcribe_chunks(
+        chunk_paths, chunks_dir,
+        backend=backend,
+        language=config.language,
+        force=config.force,
+    )
 
     # Step 4: Merge into final transcript
-    with StepTimer("merge_results") as t:
-        merge_results(chunks_dir, output_dir, force=args.force)
-    timers.append(t)
-
-    # ── Summary stats ────────────────────────────────────────────────────────
-    audio_dur = _get_audio_duration(audio_path)
-    transcribe_wall = timers[2].wall
-    rtf = audio_dur / transcribe_wall if transcribe_wall > 0 else 0.0
-
-    # Peak RSS: macOS reports bytes, Linux reports KB
-    raw_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    peak_mb = raw_rss / (1024 * 1024) if sys.platform == "darwin" else raw_rss / 1024
-
-    total_wall = sum(t.wall for t in timers)
-    total_cpu  = sum(t.cpu  for t in timers)
-
-    sep = "-" * 62
-    logging.info(sep)
-    logging.info("[STATS] %-16s  %8s  %8s  %6s  %s", "Step", "Wall", "CPU", "CPU%", "Note")
-    logging.info("[STATS] %s", sep)
-    for i, timer in enumerate(timers):
-        cpu_pct = (timer.cpu / timer.wall * 100) if timer.wall > 0 else 0.0
-        note = f"{rtf:.1f}x real-time" if i == 2 else ""
-        logging.info("[STATS] %-16s  %8s  %8s  %5.1f%%  %s",
-                     timer.name, _fmt_dur(timer.wall), _fmt_dur(timer.cpu), cpu_pct, note)
-    logging.info("[STATS] %s", sep)
-    total_pct = (total_cpu / total_wall * 100) if total_wall > 0 else 0.0
-    logging.info("[STATS] %-16s  %8s  %8s  %5.1f%%",
-                 "TOTAL", _fmt_dur(total_wall), _fmt_dur(total_cpu), total_pct)
-    logging.info("[STATS] Peak RAM: %.0f MB  |  Audio: %s  |  Segments: see transcript",
-                 peak_mb, _fmt_dur(audio_dur))
-    logging.info(sep)
+    merge_results(chunks_dir, output_dir, force=config.force)
 
     logging.info("=" * 60)
     logging.info("[PIPELINE] All done!")
@@ -497,7 +432,16 @@ examples:
                         help="Re-run all steps, ignoring existing checkpoints")
 
     args = parser.parse_args()
-    run_pipeline(args)
+    config = PipelineConfig(
+        input=Path(args.input),
+        model=args.model,
+        language=args.language,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        speedup=args.speedup,
+        chunk_duration=args.chunk_duration,
+        force=args.force,
+    )
+    run_pipeline(config)
 
 
 if __name__ == "__main__":
