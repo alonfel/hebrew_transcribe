@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import logging
+import resource
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -207,6 +208,8 @@ def transcribe_chunks(
 
     logging.info("[TRANSCRIBE] Using backend: %s", type(backend).__name__)
 
+    rtf_samples: list[float] = []  # audio_sec / process_sec per actually-transcribed chunk
+
     for idx, chunk_path in enumerate(chunk_paths):
         output_json = chunks_dir / f"{chunk_path.stem}.json"
         _transcribe_one(str(chunk_path), idx, str(output_json), language, backend)
@@ -317,6 +320,8 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     logging.info("[PIPELINE] Speedup:      %s", f"{config.speedup}x" if config.speedup else "disabled")
     logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
+
+    timers: list[StepTimer] = []
 
     # Step 1: Extract audio
     audio_path = extract_audio(
