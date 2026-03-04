@@ -21,7 +21,7 @@ import logging
 import resource
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -34,7 +34,18 @@ import mlx_whisper
 
 @dataclass
 class PipelineConfig:
-    """All settings for a single pipeline run."""
+    """
+    All settings for a single pipeline run.
+
+    Attributes:
+        input:          Path to the input video file.
+        model:          HuggingFace repo ID for the mlx-whisper model.
+        language:       BCP-47 language code passed to Whisper (e.g. "he", "en").
+        output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
+        speedup:        atempo speedup factor applied before chunking (None = disabled).
+        chunk_duration: Length of each audio chunk in seconds (default 180 = 3 min).
+        force:          Re-run all steps even if checkpoints already exist.
+    """
     input: Path
     model: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx"
     language: str = "he"
@@ -49,14 +60,30 @@ class PipelineConfig:
 # ---------------------------------------------------------------------------
 
 class TranscribeBackend(Protocol):
-    """Anything that can transcribe an audio file into (start, end, text) segments."""
+    """
+    Protocol (structural subtype) for transcription backends.
+
+    Any class that implements a matching ``transcribe`` method satisfies this
+    interface — no inheritance required. Swap backends by passing a different
+    implementation to ``run_pipeline``.
+    """
     def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]: ...
 
 
 class MlxWhisperBackend:
-    """Transcription via mlx-whisper (Apple Silicon GPU/Neural Engine)."""
+    """
+    Transcription via mlx-whisper (Apple Silicon GPU/Neural Engine).
+
+    Requires macOS with Apple Silicon. Uses the MLX framework to run Whisper
+    models accelerated by the GPU and Neural Engine.
+    """
 
     def __init__(self, model_repo: str) -> None:
+        """
+        Args:
+            model_repo: HuggingFace repo ID of an mlx-whisper compatible model,
+                        e.g. "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx".
+        """
         self.model_repo = model_repo
 
     def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]:
@@ -169,7 +196,7 @@ def chunk_audio(
 
 
 # ---------------------------------------------------------------------------
-# Pipeline step 3: Transcribe chunks sequentially (MLX uses GPU internally)
+# Pipeline step 3: Transcribe chunks sequentially
 # ---------------------------------------------------------------------------
 
 def transcribe_chunks(
@@ -297,7 +324,15 @@ def merge_results(
 # ---------------------------------------------------------------------------
 
 def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = None) -> None:
-    """Orchestrate all pipeline steps: extract → chunk → transcribe → merge."""
+    """
+    Orchestrate all pipeline steps: extract → chunk → transcribe → merge.
+
+    Args:
+        config:  A ``PipelineConfig`` instance with all run settings.
+        backend: Transcription backend to use. Defaults to ``MlxWhisperBackend``
+                 initialised from ``config.model``. Pass a custom backend to
+                 swap the transcription engine (e.g. for testing or other models).
+    """
     video_path = config.input.resolve()
     if not video_path.exists():
         logging.error("Input file not found: %s", video_path)
