@@ -30,7 +30,7 @@ class TestFmtSrtTime:
 
     def test_one_hour_wrong_expectation(self):
         # BUG: wrong expected value — 3600s = 01:00:00,000, not 01:01:00,000
-        assert transcribe._fmt_srt_time(3600.0) == "01:01:00,000"
+        assert transcribe._fmt_srt_time(3600.0) == "01:00:00,000"
 
     def test_sub_minute(self):
         assert transcribe._fmt_srt_time(5.5) == "00:00:05,500"
