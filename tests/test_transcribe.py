@@ -24,6 +24,25 @@ import transcribe
 # Pure function: _fmt_srt_time
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pure function: _fmt_dur
+# ---------------------------------------------------------------------------
+
+class TestFmtDur:
+    def test_sub_minute(self):
+        assert transcribe._fmt_dur(45.0) == "45.0s"
+
+    def test_exactly_one_minute(self):
+        assert transcribe._fmt_dur(60.0) == "1m00s"
+
+    def test_minutes_and_seconds(self):
+        assert transcribe._fmt_dur(150.0) == "2m30s"
+
+
+# ---------------------------------------------------------------------------
+# Pure function: _fmt_srt_time
+# ---------------------------------------------------------------------------
+
 class TestFmtSrtTime:
     def test_zero(self):
         assert transcribe._fmt_srt_time(0.0) == "00:00:00,000"
@@ -146,6 +165,52 @@ class TestMergeResults:
         txt = (tmp_path / "transcript.txt").read_text(encoding="utf-8")
         assert txt == "חדש"
 
+    def test_srt_block_exact_format(self, tmp_path):
+        # Guards against index/timestamp/text line ordering being reshuffled
+        chunks_dir = tmp_path / "chunks"
+        chunks_dir.mkdir()
+        self._write_chunk(chunks_dir, "chunk_000", [[0.5, 2.0, "שלום"]])
+
+        with patch("transcribe._get_audio_duration", return_value=180.0):
+            transcribe.merge_results(chunks_dir, tmp_path)
+
+        srt = (tmp_path / "transcript.srt").read_text(encoding="utf-8")
+        lines = srt.strip().split("\n")
+        assert lines[0] == "1"
+        assert lines[1] == "00:00:00,500 --> 00:00:02,000"
+        assert lines[2] == "שלום"
+
+    def test_variable_chunk_durations_offset(self, tmp_path):
+        # Both chunks use the SAME mock value in test_two_chunks_offset_applied.
+        # This test uses different durations to catch bugs where offset uses
+        # wrong index or wrong accumulation order.
+        chunks_dir = tmp_path / "chunks"
+        chunks_dir.mkdir()
+        self._write_chunk(chunks_dir, "chunk_000", [[0.0, 1.0, "א"]])
+        self._write_chunk(chunks_dir, "chunk_001", [[0.0, 2.0, "ב"]])
+
+        with patch("transcribe._get_audio_duration", side_effect=[95.5, 85.0]):
+            transcribe.merge_results(chunks_dir, tmp_path)
+
+        srt = (tmp_path / "transcript.srt").read_text(encoding="utf-8")
+        # chunk_001 offset = 95.5s → [95.5, 97.5] → 00:01:35,500 --> 00:01:37,500
+        assert "00:01:35,500 --> 00:01:37,500" in srt
+
+    def test_txt_newline_joins_segments(self, tmp_path):
+        chunks_dir = tmp_path / "chunks"
+        chunks_dir.mkdir()
+        self._write_chunk(chunks_dir, "chunk_000", [
+            [0.0, 1.0, "שורה ראשונה"],
+            [1.0, 2.0, "שורה שנייה"],
+            [2.0, 3.0, "שורה שלישית"],
+        ])
+
+        with patch("transcribe._get_audio_duration", return_value=180.0):
+            transcribe.merge_results(chunks_dir, tmp_path)
+
+        txt = (tmp_path / "transcript.txt").read_text(encoding="utf-8")
+        assert txt == "שורה ראשונה\nשורה שנייה\nשורה שלישית"
+
 
 # ---------------------------------------------------------------------------
 # extract_audio
@@ -208,6 +273,15 @@ class TestExtractAudio:
         assert af.startswith("atempo=1.2")
         assert "silenceremove" not in af
 
+    def test_speedup_1_0_not_applied(self, tmp_path):
+        # speedup=1.0 means no change; the condition `speedup and speedup != 1.0`
+        # must suppress atempo so we don't pass an identity filter
+        with patch("transcribe._run") as mock_run:
+            transcribe.extract_audio(Path("input.mov"), tmp_path, speedup=1.0)
+
+        cmd = mock_run.call_args[0][0]
+        assert "-af" not in cmd
+
     def test_speedup_with_silence_removal(self, tmp_path):
         with patch("transcribe._run") as mock_run:
             transcribe.extract_audio(Path("input.mov"), tmp_path, speedup=1.2, remove_silence=True)
@@ -247,6 +321,56 @@ class TestChunkAudio:
         cmd = mock_run.call_args[0][0]
         assert "-segment_time" in cmd
         assert cmd[cmd.index("-segment_time") + 1] == "120"
+
+    def test_copy_codec_and_segment_format_in_cmd(self, tmp_path):
+        # -c copy avoids re-encoding; -f segment enables the segmenter muxer.
+        # Both are critical — losing either silently changes behaviour.
+        with patch("transcribe._run") as mock_run:
+            transcribe.chunk_audio(Path("audio.wav"), tmp_path)
+
+        cmd = mock_run.call_args[0][0]
+        assert "-f" in cmd and cmd[cmd.index("-f") + 1] == "segment"
+        assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "copy"
+
+    def test_output_pattern_in_cmd(self, tmp_path):
+        with patch("transcribe._run") as mock_run:
+            transcribe.chunk_audio(Path("audio.wav"), tmp_path)
+
+        cmd = mock_run.call_args[0][0]
+        assert str(tmp_path / "chunk_%03d.wav") in cmd
+
+
+# ---------------------------------------------------------------------------
+# transcribe_chunks
+# ---------------------------------------------------------------------------
+
+class TestTranscribeChunks:
+    def test_all_done_skips_backend(self, tmp_path):
+        # If every chunk already has a .json checkpoint, the backend should
+        # never be called — guards against the all-done early-exit path breaking.
+        chunk_wav = tmp_path / "chunk_000.wav"
+        chunk_wav.touch()
+        (tmp_path / "chunk_000.json").write_text("[]", encoding="utf-8")
+
+        mock_backend = MagicMock()
+        with patch("transcribe._get_audio_duration", return_value=10.0):
+            transcribe.transcribe_chunks([chunk_wav], tmp_path, backend=mock_backend)
+
+        mock_backend.transcribe.assert_not_called()
+
+    def test_force_clears_checkpoints_and_retranscribes(self, tmp_path):
+        # force=True must delete existing .json files so _transcribe_one runs
+        # from scratch rather than skipping.
+        chunk_wav = tmp_path / "chunk_000.wav"
+        chunk_wav.touch()
+        (tmp_path / "chunk_000.json").write_text("[]", encoding="utf-8")
+
+        mock_backend = MagicMock()
+        mock_backend.transcribe.return_value = []
+        with patch("transcribe._get_audio_duration", return_value=10.0):
+            transcribe.transcribe_chunks([chunk_wav], tmp_path, backend=mock_backend, force=True)
+
+        mock_backend.transcribe.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
