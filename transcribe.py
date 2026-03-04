@@ -18,11 +18,47 @@ Usage:
 import argparse
 import json
 import logging
+import resource
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import mlx_whisper
+
+
+# ---------------------------------------------------------------------------
+# Step timer — wall time, CPU time, CPU utilisation
+# ---------------------------------------------------------------------------
+
+class StepTimer:
+    """Context manager that measures wall time and CPU time for a pipeline step."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.wall: float = 0.0
+        self.cpu: float = 0.0
+
+    def __enter__(self) -> "StepTimer":
+        self._wall_start = time.perf_counter()
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self._cpu_start = ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.wall = time.perf_counter() - self._wall_start
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self.cpu = (ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime) - self._cpu_start
+
+
+def _fmt_dur(secs: float) -> str:
+    """Format a duration in seconds as a concise human-readable string."""
+    if secs < 60:
+        return f"{secs:.1f}s"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m{s:02d}s"
 
 
 def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, model_repo: str) -> None:
@@ -169,11 +205,45 @@ def transcribe_chunks(
         logging.info("[TRANSCRIBE] All chunks already transcribed — skipping")
         return
 
+    # Pre-measure actual audio durations for accurate ETA (fast ffprobe metadata reads)
+    chunk_audio_durs = [_get_audio_duration(p) for p in chunk_paths]
+
+    remaining_audio = sum(
+        d for p, d in zip(chunk_paths, chunk_audio_durs)
+        if not (chunks_dir / f"{p.stem}.json").exists()
+    )
+    rough_est = remaining_audio / 10.0  # assume 10x RTF until we have real data
+    logging.info(
+        "[TRANSCRIBE] Audio to transcribe: %s | Rough estimate: ~%s (at 10x real-time)",
+        _fmt_dur(remaining_audio), _fmt_dur(rough_est),
+    )
     logging.info("[TRANSCRIBE] Using model: %s", model_name)
+
+    rtf_samples: list[float] = []  # audio_sec / process_sec per actually-transcribed chunk
 
     for idx, chunk_path in enumerate(chunk_paths):
         output_json = chunks_dir / f"{chunk_path.stem}.json"
+        was_done = output_json.exists()
+
+        t0 = time.perf_counter()
         _transcribe_one(str(chunk_path), idx, str(output_json), language, model_name)
+        elapsed = time.perf_counter() - t0
+
+        if not was_done and elapsed > 0:
+            rtf_samples.append(chunk_audio_durs[idx] / elapsed)
+
+        # ETA: remaining audio / avg real-time factor
+        left_audio = sum(
+            chunk_audio_durs[j]
+            for j in range(idx + 1, len(chunk_paths))
+            if not (chunks_dir / f"{chunk_paths[j].stem}.json").exists()
+        )
+        if rtf_samples and left_audio > 0:
+            avg_rtf = sum(rtf_samples) / len(rtf_samples)
+            logging.info(
+                "[TRANSCRIBE] Progress: %d/%d | RTF %.1fx | ETA ~%s",
+                idx + 1, total, avg_rtf, _fmt_dur(left_audio / avg_rtf),
+            )
 
     done_after = sum(1 for p in chunk_paths if (chunks_dir / f"{p.stem}.json").exists())
     logging.info("[TRANSCRIBE] Done — %d/%d chunks transcribed", done_after, total)
@@ -279,33 +349,72 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logging.info("[PIPELINE] Force re-run: %s", args.force)
     logging.info("=" * 60)
 
+    timers: list[StepTimer] = []
+
     # Step 1: Extract audio
-    audio_path = extract_audio(
-        video_path, output_dir,
-        speedup=args.speedup,
-        force=args.force,
-    )
+    with StepTimer("extract_audio") as t:
+        audio_path = extract_audio(
+            video_path, output_dir,
+            speedup=args.speedup,
+            force=args.force,
+        )
+    timers.append(t)
 
     # Step 2: Chunk audio
-    chunk_paths = chunk_audio(
-        audio_path, chunks_dir,
-        chunk_duration=args.chunk_duration,
-        force=args.force,
-    )
+    with StepTimer("chunk_audio") as t:
+        chunk_paths = chunk_audio(
+            audio_path, chunks_dir,
+            chunk_duration=args.chunk_duration,
+            force=args.force,
+        )
+    timers.append(t)
     if not chunk_paths:
         logging.error("[PIPELINE] No chunks produced — aborting")
         sys.exit(1)
 
     # Step 3: Transcribe chunks
-    transcribe_chunks(
-        chunk_paths, chunks_dir,
-        model_name=args.model,
-        language=args.language,
-        force=args.force,
-    )
+    with StepTimer("transcribe") as t:
+        transcribe_chunks(
+            chunk_paths, chunks_dir,
+            model_name=args.model,
+            language=args.language,
+            force=args.force,
+        )
+    timers.append(t)
 
     # Step 4: Merge into final transcript
-    merge_results(chunks_dir, output_dir, force=args.force)
+    with StepTimer("merge_results") as t:
+        merge_results(chunks_dir, output_dir, force=args.force)
+    timers.append(t)
+
+    # ── Summary stats ────────────────────────────────────────────────────────
+    audio_dur = _get_audio_duration(audio_path)
+    transcribe_wall = timers[2].wall
+    rtf = audio_dur / transcribe_wall if transcribe_wall > 0 else 0.0
+
+    # Peak RSS: macOS reports bytes, Linux reports KB
+    raw_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_mb = raw_rss / (1024 * 1024) if sys.platform == "darwin" else raw_rss / 1024
+
+    total_wall = sum(t.wall for t in timers)
+    total_cpu  = sum(t.cpu  for t in timers)
+
+    sep = "-" * 62
+    logging.info(sep)
+    logging.info("[STATS] %-16s  %8s  %8s  %6s  %s", "Step", "Wall", "CPU", "CPU%", "Note")
+    logging.info("[STATS] %s", sep)
+    for i, timer in enumerate(timers):
+        cpu_pct = (timer.cpu / timer.wall * 100) if timer.wall > 0 else 0.0
+        note = f"{rtf:.1f}x real-time" if i == 2 else ""
+        logging.info("[STATS] %-16s  %8s  %8s  %5.1f%%  %s",
+                     timer.name, _fmt_dur(timer.wall), _fmt_dur(timer.cpu), cpu_pct, note)
+    logging.info("[STATS] %s", sep)
+    total_pct = (total_cpu / total_wall * 100) if total_wall > 0 else 0.0
+    logging.info("[STATS] %-16s  %8s  %8s  %5.1f%%",
+                 "TOTAL", _fmt_dur(total_wall), _fmt_dur(total_cpu), total_pct)
+    logging.info("[STATS] Peak RAM: %.0f MB  |  Audio: %s  |  Segments: see transcript",
+                 peak_mb, _fmt_dur(audio_dur))
+    logging.info(sep)
 
     logging.info("=" * 60)
     logging.info("[PIPELINE] All done!")
