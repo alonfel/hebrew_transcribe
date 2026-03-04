@@ -18,9 +18,9 @@ Usage:
 import argparse
 import json
 import logging
-import resource
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -43,7 +43,7 @@ class PipelineConfig:
         language:       BCP-47 language code passed to Whisper (e.g. "he", "en").
         output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
         speedup:        atempo speedup factor applied before chunking (None = disabled).
-        chunk_duration: Length of each audio chunk in seconds (default 180 = 3 min).
+        chunk_duration: Length of each audio chunk in seconds (default 60 = 1 min).
         force:          Re-run all steps even if checkpoints already exist.
     """
     input: Path
@@ -51,7 +51,7 @@ class PipelineConfig:
     language: str = "he"
     output_dir: Path | None = None
     speedup: float | None = None
-    chunk_duration: int = 180
+    chunk_duration: int = 60
     force: bool = False
 
 
@@ -235,11 +235,41 @@ def transcribe_chunks(
 
     logging.info("[TRANSCRIBE] Using backend: %s", type(backend).__name__)
 
-    rtf_samples: list[float] = []  # audio_sec / process_sec per actually-transcribed chunk
+    # Pre-measure audio durations once (fast ffprobe metadata reads) for accurate ETA
+    chunk_audio_durs = [_get_audio_duration(p) for p in chunk_paths]
+    pending_audio = sum(
+        d for p, d in zip(chunk_paths, chunk_audio_durs)
+        if not (chunks_dir / f"{p.stem}.json").exists()
+    )
+    logging.info(
+        "[TRANSCRIBE] Audio to process: %s | Rough estimate: ~%s (at 10x real-time)",
+        _fmt_dur(pending_audio), _fmt_dur(pending_audio / 10.0),
+    )
+
+    rtf_samples: list[float] = []  # speed = audio_secs / wall_secs per processed chunk
 
     for idx, chunk_path in enumerate(chunk_paths):
         output_json = chunks_dir / f"{chunk_path.stem}.json"
+        was_done = output_json.exists()
+
+        t0 = time.perf_counter()
         _transcribe_one(str(chunk_path), idx, str(output_json), language, backend)
+        elapsed = time.perf_counter() - t0
+
+        if not was_done and elapsed > 0:
+            rtf_samples.append(chunk_audio_durs[idx] / elapsed)
+
+        left_audio = sum(
+            chunk_audio_durs[j]
+            for j in range(idx + 1, len(chunk_paths))
+            if not (chunks_dir / f"{chunk_paths[j].stem}.json").exists()
+        )
+        if rtf_samples and left_audio > 0:
+            avg_speed = sum(rtf_samples) / len(rtf_samples)
+            logging.info(
+                "[TRANSCRIBE] %d/%d done | speed %.1fx real-time | ETA ~%s",
+                idx + 1, total, avg_speed, _fmt_dur(left_audio / avg_speed),
+            )
 
     done_after = sum(1 for p in chunk_paths if (chunks_dir / f"{p.stem}.json").exists())
     logging.info("[TRANSCRIBE] Done — %d/%d chunks transcribed", done_after, total)
@@ -356,8 +386,6 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
 
-    timers: list[StepTimer] = []
-
     # Step 1: Extract audio
     audio_path = extract_audio(
         video_path, output_dir,
@@ -396,6 +424,14 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _fmt_dur(secs: float) -> str:
+    """Format a duration in seconds as a concise human-readable string."""
+    if secs < 60:
+        return f"{secs:.1f}s"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m{s:02d}s"
+
 
 def _run(cmd: list[str]) -> None:
     """Run a subprocess command; captures stderr and shows it only on failure."""
@@ -461,8 +497,8 @@ examples:
     parser.add_argument("--language", default="he", help="Language code (default: he for Hebrew)")
     parser.add_argument("--speedup", type=float, default=None,
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
-    parser.add_argument("--chunk-duration", type=int, default=180,
-                        help="Chunk duration in seconds (default: 180 = 3 minutes)")
+    parser.add_argument("--chunk-duration", type=int, default=60,
+                        help="Chunk duration in seconds (default: 60 = 1 minute)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps, ignoring existing checkpoints")
 
