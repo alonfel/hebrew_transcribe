@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hebrew transcription pipeline for iPhone videos.
+Transcription pipeline for iPhone videos — Hebrew and English.
 
 Runs fully locally using mlx-whisper (Apple Silicon GPU) and ffmpeg.
 
@@ -9,7 +9,8 @@ Installation:
     pip install -r requirements.txt
 
 Usage:
-    python transcribe.py input_video.mov
+    python transcribe.py input_video.mov                  # Hebrew (default)
+    python transcribe.py input_video.mov --language en    # English
     python transcribe.py input_video.mov --speedup 1.1
     python transcribe.py input_video.mov --force          # re-run all steps
     python transcribe.py input_video.mov --output-dir ./out
@@ -29,6 +30,15 @@ import mlx_whisper
 
 
 # ---------------------------------------------------------------------------
+# Model defaults per language
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODELS: dict[str, str] = {
+    "he": "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",  # Hebrew fine-tune
+    "en": "mlx-community/whisper-large-v3-turbo",               # Base multilingual, best for English
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -39,7 +49,7 @@ class PipelineConfig:
 
     Attributes:
         input:          Path to the input video file.
-        model:          HuggingFace repo ID for the mlx-whisper model.
+        model:          HuggingFace repo ID for the mlx-whisper model (auto-selected by language if not set via CLI).
         language:       BCP-47 language code passed to Whisper (e.g. "he", "en").
         output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
         speedup:        atempo speedup factor applied before chunking (None = disabled).
@@ -480,21 +490,25 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Local Hebrew transcription pipeline for iPhone videos",
+        description="Local transcription pipeline for iPhone videos — Hebrew and English.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
+  # Hebrew (default) — uses ivrit-ai Hebrew fine-tune
   python transcribe.py lecture.mov
   python transcribe.py lecture.mov --speedup 1.1
-  python transcribe.py lecture.mov --output-dir ./output --force
-  python transcribe.py lecture.mov --model mlx-community/whisper-large-v3-mlx --language en
+  python transcribe.py lecture.mov --force
+
+  # English — auto-selects whisper-large-v3-turbo
+  python transcribe.py lecture.mov --language en
+  python transcribe.py lecture.mov --language en --output-dir ./output
         """,
     )
     parser.add_argument("input", help="Path to input video file (e.g. video.mov, video.mp4)")
     parser.add_argument("--output-dir", help="Output directory (default: {input_stem}_output next to input)")
-    parser.add_argument("--model", default="mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
-                        help="HuggingFace repo for mlx-whisper model (default: ivrit-ai-whisper-large-v3-turbo-mlx)")
-    parser.add_argument("--language", default="he", help="Language code (default: he for Hebrew)")
+    parser.add_argument("--model", default=None,
+                        help="HuggingFace repo for mlx-whisper model (default: auto-selected by --language)")
+    parser.add_argument("--language", default="he", help="Language code: 'he' (Hebrew) or 'en' (English). Default: he")
     parser.add_argument("--speedup", type=float, default=None,
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
     parser.add_argument("--chunk-duration", type=int, default=180,
@@ -503,9 +517,12 @@ examples:
                         help="Re-run all steps, ignoring existing checkpoints")
 
     args = parser.parse_args()
+    model = args.model or DEFAULT_MODELS.get(args.language, DEFAULT_MODELS["he"])
+    if args.model is None:
+        logging.info("[CONFIG] Auto-selected model for language '%s': %s", args.language, model)
     config = PipelineConfig(
         input=Path(args.input),
-        model=args.model,
+        model=model,
         language=args.language,
         output_dir=Path(args.output_dir) if args.output_dir else None,
         speedup=args.speedup,

@@ -5,8 +5,17 @@ Fully local, offline transcription pipeline for iPhone video recordings (.mov, .
 Extracts audio → chunks → transcribes sequentially → outputs `transcript.txt` + `transcript.srt`.
 
 ## Stack
-- **mlx-whisper** (Apple Silicon GPU/Neural Engine) — default model `mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx` (Hebrew fine-tune)
+- **mlx-whisper** (Apple Silicon GPU/Neural Engine) — model auto-selected by language (see below)
 - **ffmpeg** — audio extraction, silence removal, chunking
+
+## Supported languages & models
+
+| Language | Flag | Model (HuggingFace) |
+|---|---|---|
+| Hebrew (default) | `--language he` | `mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx` |
+| English | `--language en` | `mlx-community/whisper-large-v3-turbo` |
+
+The model is auto-selected based on `--language`. Override with `--model` if needed.
 
 ## Key design decisions
 - mlx-whisper uses Apple Silicon GPU/Neural Engine natively — no multiprocessing needed
@@ -45,11 +54,16 @@ pip install -r requirements.txt
 # Activate venv first
 source venv/bin/activate
 
-python transcribe.py input.mov                        # basic
+# Hebrew (default) — uses ivrit-ai Hebrew fine-tune
+python transcribe.py input.mov
+
+# English — auto-selects whisper-large-v3-turbo (downloads ~800MB on first run)
+python transcribe.py input.mov --language en
+
+# Other options
 python transcribe.py input.mov --speedup 1.1          # 10% faster audio
 python transcribe.py input.mov --force                # re-run all steps
-python transcribe.py input.mov --model mlx-community/whisper-large-v3-mlx  # different model
-python transcribe.py input.mov --language en          # non-Hebrew
+python transcribe.py input.mov --model mlx-community/whisper-large-v3-turbo --language en  # explicit model
 ```
 
 ## Resume behavior
