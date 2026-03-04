@@ -20,12 +20,50 @@ import json
 import logging
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import mlx_whisper
 
 
-def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, model_repo: str) -> None:
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineConfig:
+    """All settings for a single pipeline run."""
+    input: Path
+    model: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx"
+    language: str = "he"
+    output_dir: Path | None = None
+    speedup: float | None = None
+    chunk_duration: int = 180
+    force: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
+
+class TranscribeBackend(Protocol):
+    """Anything that can transcribe an audio file into (start, end, text) segments."""
+    def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]: ...
+
+
+class MlxWhisperBackend:
+    """Transcription via mlx-whisper (Apple Silicon GPU/Neural Engine)."""
+
+    def __init__(self, model_repo: str) -> None:
+        self.model_repo = model_repo
+
+    def transcribe(self, audio_path: str, language: str) -> list[tuple[float, float, str]]:
+        result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=self.model_repo, language=language)
+        return [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+
+
+def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, backend: TranscribeBackend) -> None:
     """
     Transcribe a single chunk and save the result to a JSON checkpoint file.
     Skips if the checkpoint already exists (resume support).
@@ -38,9 +76,7 @@ def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language:
 
     logging.info("[TRANSCRIBE] chunk_%03d — transcribing %s ...", chunk_idx, Path(chunk_path).name)
 
-    result = mlx_whisper.transcribe(chunk_path, path_or_hf_repo=model_repo, language=language)
-
-    segs = [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+    segs = backend.transcribe(chunk_path, language)
     out.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
 
     logging.info("[TRANSCRIBE] chunk_%03d — done (%d segments)", chunk_idx, len(segs))
@@ -138,12 +174,12 @@ def chunk_audio(
 def transcribe_chunks(
     chunk_paths: list[Path],
     chunks_dir: Path,
-    model_name: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
+    backend: TranscribeBackend,
     language: str = "he",
     force: bool = False,
 ) -> None:
     """
-    Transcribe all chunks using mlx-whisper (Apple Silicon GPU/Neural Engine).
+    Transcribe all chunks using the provided backend.
 
     Each completed chunk is saved to chunk_NNN.json immediately as a resume
     checkpoint. Skips chunks whose .json already exists (unless force=True).
@@ -169,11 +205,11 @@ def transcribe_chunks(
         logging.info("[TRANSCRIBE] All chunks already transcribed — skipping")
         return
 
-    logging.info("[TRANSCRIBE] Using model: %s", model_name)
+    logging.info("[TRANSCRIBE] Using backend: %s", type(backend).__name__)
 
     for idx, chunk_path in enumerate(chunk_paths):
         output_json = chunks_dir / f"{chunk_path.stem}.json"
-        _transcribe_one(str(chunk_path), idx, str(output_json), language, model_name)
+        _transcribe_one(str(chunk_path), idx, str(output_json), language, backend)
 
     done_after = sum(1 for p in chunk_paths if (chunks_dir / f"{p.stem}.json").exists())
     logging.info("[TRANSCRIBE] Done — %d/%d chunks transcribed", done_after, total)
@@ -257,14 +293,17 @@ def merge_results(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = None) -> None:
     """Orchestrate all pipeline steps: extract → chunk → transcribe → merge."""
-    video_path = Path(args.input).resolve()
+    video_path = config.input.resolve()
     if not video_path.exists():
         logging.error("Input file not found: %s", video_path)
         sys.exit(1)
 
-    output_dir = Path(args.output_dir) if args.output_dir else video_path.parent / f"{video_path.stem}_output"
+    if backend is None:
+        backend = MlxWhisperBackend(config.model)
+
+    output_dir = config.output_dir or video_path.parent / f"{video_path.stem}_output"
     chunks_dir = output_dir / "chunks"
     output_dir.mkdir(parents=True, exist_ok=True)
     chunks_dir.mkdir(parents=True, exist_ok=True)
@@ -272,25 +311,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logging.info("=" * 60)
     logging.info("[PIPELINE] Input:        %s", video_path)
     logging.info("[PIPELINE] Output dir:   %s", output_dir)
-    logging.info("[PIPELINE] Model:        %s", args.model)
-    logging.info("[PIPELINE] Language:     %s", args.language)
-    logging.info("[PIPELINE] Chunk dur:    %ds", args.chunk_duration)
-    logging.info("[PIPELINE] Speedup:      %s", f"{args.speedup}x" if args.speedup else "disabled")
-    logging.info("[PIPELINE] Force re-run: %s", args.force)
+    logging.info("[PIPELINE] Model:        %s", config.model)
+    logging.info("[PIPELINE] Language:     %s", config.language)
+    logging.info("[PIPELINE] Chunk dur:    %ds", config.chunk_duration)
+    logging.info("[PIPELINE] Speedup:      %s", f"{config.speedup}x" if config.speedup else "disabled")
+    logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
 
     # Step 1: Extract audio
     audio_path = extract_audio(
         video_path, output_dir,
-        speedup=args.speedup,
-        force=args.force,
+        speedup=config.speedup,
+        force=config.force,
     )
 
     # Step 2: Chunk audio
     chunk_paths = chunk_audio(
         audio_path, chunks_dir,
-        chunk_duration=args.chunk_duration,
-        force=args.force,
+        chunk_duration=config.chunk_duration,
+        force=config.force,
     )
     if not chunk_paths:
         logging.error("[PIPELINE] No chunks produced — aborting")
@@ -299,13 +338,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
     # Step 3: Transcribe chunks
     transcribe_chunks(
         chunk_paths, chunks_dir,
-        model_name=args.model,
-        language=args.language,
-        force=args.force,
+        backend=backend,
+        language=config.language,
+        force=config.force,
     )
 
     # Step 4: Merge into final transcript
-    merge_results(chunks_dir, output_dir, force=args.force)
+    merge_results(chunks_dir, output_dir, force=config.force)
 
     logging.info("=" * 60)
     logging.info("[PIPELINE] All done!")
@@ -388,7 +427,16 @@ examples:
                         help="Re-run all steps, ignoring existing checkpoints")
 
     args = parser.parse_args()
-    run_pipeline(args)
+    config = PipelineConfig(
+        input=Path(args.input),
+        model=args.model,
+        language=args.language,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        speedup=args.speedup,
+        chunk_duration=args.chunk_duration,
+        force=args.force,
+    )
+    run_pipeline(config)
 
 
 if __name__ == "__main__":

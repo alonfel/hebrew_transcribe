@@ -12,7 +12,7 @@ Focuses on:
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -234,34 +234,50 @@ class TestTranscribeOne:
     def test_skips_if_json_exists(self, tmp_path):
         output_json = tmp_path / "chunk_000.json"
         output_json.touch()
-        with patch("mlx_whisper.transcribe") as mock_t:
-            transcribe._transcribe_one(
-                str(tmp_path / "chunk_000.wav"), 0, str(output_json), "he", MODEL_REPO
-            )
-            mock_t.assert_not_called()
+
+        mock_backend = MagicMock()
+        transcribe._transcribe_one(
+            str(tmp_path / "chunk_000.wav"), 0, str(output_json), "he", mock_backend
+        )
+        mock_backend.transcribe.assert_not_called()
 
     def test_writes_json_checkpoint(self, tmp_path):
         chunk_wav = tmp_path / "chunk_000.wav"
         chunk_wav.touch()
         output_json = tmp_path / "chunk_000.json"
 
-        with patch("mlx_whisper.transcribe", return_value={"segments": [
-            {"start": 0.0, "end": 1.5, "text": " שלום "}
-        ]}):
-            transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", MODEL_REPO)
+        mock_backend = MagicMock()
+        mock_backend.transcribe.return_value = [(0.0, 1.5, "שלום")]
+        transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", mock_backend)
 
         assert output_json.exists()
         data = json.loads(output_json.read_text(encoding="utf-8"))
-        assert data == [[0.0, 1.5, "שלום"]]  # text is stripped
+        assert data == [[0.0, 1.5, "שלום"]]
 
-    def test_calls_model_with_correct_args(self, tmp_path):
+    def test_calls_backend_with_correct_args(self, tmp_path):
         chunk_wav = tmp_path / "chunk_000.wav"
         chunk_wav.touch()
         output_json = tmp_path / "chunk_000.json"
 
-        with patch("mlx_whisper.transcribe", return_value={"segments": []}) as mock_t:
-            transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", MODEL_REPO)
+        mock_backend = MagicMock()
+        mock_backend.transcribe.return_value = []
+        transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", mock_backend)
 
-        mock_t.assert_called_once_with(
-            str(chunk_wav), path_or_hf_repo=MODEL_REPO, language="he"
-        )
+        mock_backend.transcribe.assert_called_once_with(str(chunk_wav), "he")
+
+
+class TestMlxWhisperBackend:
+    def test_calls_mlx_with_correct_args(self):
+        with patch("mlx_whisper.transcribe", return_value={"segments": []}) as mock_t:
+            backend = transcribe.MlxWhisperBackend(MODEL_REPO)
+            backend.transcribe("audio.wav", "he")
+
+        mock_t.assert_called_once_with("audio.wav", path_or_hf_repo=MODEL_REPO, language="he")
+
+    def test_strips_text_and_returns_tuples(self):
+        raw = {"segments": [{"start": 0.0, "end": 1.5, "text": " שלום "}]}
+        with patch("mlx_whisper.transcribe", return_value=raw):
+            backend = transcribe.MlxWhisperBackend(MODEL_REPO)
+            result = backend.transcribe("audio.wav", "he")
+
+        assert result == [(0.0, 1.5, "שלום")]
