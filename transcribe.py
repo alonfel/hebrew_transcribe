@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hebrew transcription pipeline for iPhone videos.
+Transcription pipeline for iPhone videos — Hebrew and English.
 
 Runs fully locally using mlx-whisper (Apple Silicon GPU) and ffmpeg.
 
@@ -9,7 +9,8 @@ Installation:
     pip install -r requirements.txt
 
 Usage:
-    python transcribe.py input_video.mov
+    python transcribe.py input_video.mov                  # Hebrew (default)
+    python transcribe.py input_video.mov --language en    # English
     python transcribe.py input_video.mov --speedup 1.1
     python transcribe.py input_video.mov --force          # re-run all steps
     python transcribe.py input_video.mov --output-dir ./out
@@ -29,6 +30,15 @@ import mlx_whisper
 
 
 # ---------------------------------------------------------------------------
+# Model defaults per language
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODELS: dict[str, str] = {
+    "he": "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",  # Hebrew fine-tune
+    "en": "mlx-community/whisper-large-v3-turbo",               # Base multilingual, best for English
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -39,11 +49,12 @@ class PipelineConfig:
 
     Attributes:
         input:          Path to the input video file.
-        model:          HuggingFace repo ID for the mlx-whisper model.
+        model:          HuggingFace repo ID for the mlx-whisper model (auto-selected by language if not set via CLI).
         language:       BCP-47 language code passed to Whisper (e.g. "he", "en").
         output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
         speedup:        atempo speedup factor applied before chunking (None = disabled).
-        chunk_duration: Length of each audio chunk in seconds (default 60 = 1 min).
+        chunk_duration: Length of each audio chunk in seconds (default 180 = 3 min).
+        remove_silence: Remove silence from audio before chunking (faster but SRT timestamps won't match original video).
         force:          Re-run all steps even if checkpoints already exist.
     """
     input: Path
@@ -51,7 +62,8 @@ class PipelineConfig:
     language: str = "he"
     output_dir: Path | None = None
     speedup: float | None = None
-    chunk_duration: int = 60
+    chunk_duration: int = 180
+    remove_silence: bool = False
     force: bool = False
 
 
@@ -118,11 +130,14 @@ def extract_audio(
     video_path: Path,
     output_dir: Path,
     speedup: float | None = None,
+    remove_silence: bool = False,
     force: bool = False,
 ) -> Path:
     """
-    Extract audio from video to mono 16kHz WAV with silence removal.
+    Extract audio from video to mono 16kHz WAV.
     Applies optional speedup (atempo filter) if requested.
+    Applies silence removal only when remove_silence=True; disabling it
+    preserves the original video timeline so SRT timestamps stay in sync.
 
     Skips if audio.wav already exists (unless force=True).
     """
@@ -139,16 +154,18 @@ def extract_audio(
     if speedup and speedup != 1.0:
         logging.info("[EXTRACT] Speedup: %.2fx (atempo filter)", speedup)
         filters.append(f"atempo={speedup}")
-    filters.append("silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB")
+    if remove_silence:
+        filters.append("silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB")
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-ac", "1",           # mono
         "-ar", "16000",       # 16kHz
-        "-af", ",".join(filters),
-        str(audio_path),
     ]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd.append(str(audio_path))
     _run(cmd)
     logging.info("[EXTRACT] Done → %s", audio_path)
     return audio_path
@@ -383,6 +400,7 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     logging.info("[PIPELINE] Language:     %s", config.language)
     logging.info("[PIPELINE] Chunk dur:    %ds", config.chunk_duration)
     logging.info("[PIPELINE] Speedup:      %s", f"{config.speedup}x" if config.speedup else "disabled")
+    logging.info("[PIPELINE] Silence rem:  %s", "enabled" if config.remove_silence else "disabled (timestamps match original video)")
     logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
 
@@ -390,6 +408,7 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     audio_path = extract_audio(
         video_path, output_dir,
         speedup=config.speedup,
+        remove_silence=config.remove_silence,
         force=config.force,
     )
 
@@ -480,36 +499,46 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Local Hebrew transcription pipeline for iPhone videos",
+        description="Local transcription pipeline for iPhone videos — Hebrew and English.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
+  # Hebrew (default) — uses ivrit-ai Hebrew fine-tune
   python transcribe.py lecture.mov
   python transcribe.py lecture.mov --speedup 1.1
-  python transcribe.py lecture.mov --output-dir ./output --force
-  python transcribe.py lecture.mov --model mlx-community/whisper-large-v3-mlx --language en
+  python transcribe.py lecture.mov --force
+
+  # English — auto-selects whisper-large-v3-turbo
+  python transcribe.py lecture.mov --language en
+  python transcribe.py lecture.mov --language en --output-dir ./output
         """,
     )
     parser.add_argument("input", help="Path to input video file (e.g. video.mov, video.mp4)")
     parser.add_argument("--output-dir", help="Output directory (default: {input_stem}_output next to input)")
-    parser.add_argument("--model", default="mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
-                        help="HuggingFace repo for mlx-whisper model (default: ivrit-ai-whisper-large-v3-turbo-mlx)")
-    parser.add_argument("--language", default="he", help="Language code (default: he for Hebrew)")
+    parser.add_argument("--model", default=None,
+                        help="HuggingFace repo for mlx-whisper model (default: auto-selected by --language)")
+    parser.add_argument("--language", default="he", help="Language code: 'he' (Hebrew) or 'en' (English). Default: he")
     parser.add_argument("--speedup", type=float, default=None,
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
-    parser.add_argument("--chunk-duration", type=int, default=60,
-                        help="Chunk duration in seconds (default: 60 = 1 minute)")
+    parser.add_argument("--chunk-duration", type=int, default=180,
+                        help="Chunk duration in seconds (default: 180 = 3 minutes)")
+    parser.add_argument("--remove-silence", action="store_true", default=False,
+                        help="Remove silence before transcription (faster but SRT timestamps won't match original video)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps, ignoring existing checkpoints")
 
     args = parser.parse_args()
+    model = args.model or DEFAULT_MODELS.get(args.language, DEFAULT_MODELS["he"])
+    if args.model is None:
+        logging.info("[CONFIG] Auto-selected model for language '%s': %s", args.language, model)
     config = PipelineConfig(
         input=Path(args.input),
-        model=args.model,
+        model=model,
         language=args.language,
         output_dir=Path(args.output_dir) if args.output_dir else None,
         speedup=args.speedup,
         chunk_duration=args.chunk_duration,
+        remove_silence=args.remove_silence,
         force=args.force,
     )
     run_pipeline(config)
