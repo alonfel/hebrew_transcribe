@@ -43,7 +43,7 @@ class PipelineConfig:
         language:       BCP-47 language code passed to Whisper (e.g. "he", "en").
         output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
         speedup:        atempo speedup factor applied before chunking (None = disabled).
-        chunk_duration: Length of each audio chunk in seconds (default 60 = 1 min).
+        chunk_duration: Length of each audio chunk in seconds (default 180 = 3 min).
         force:          Re-run all steps even if checkpoints already exist.
     """
     input: Path
@@ -51,7 +51,7 @@ class PipelineConfig:
     language: str = "he"
     output_dir: Path | None = None
     speedup: float | None = None
-    chunk_duration: int = 60
+    chunk_duration: int = 180
     force: bool = False
 
 
@@ -497,8 +497,8 @@ examples:
     parser.add_argument("--language", default="he", help="Language code (default: he for Hebrew)")
     parser.add_argument("--speedup", type=float, default=None,
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
-    parser.add_argument("--chunk-duration", type=int, default=60,
-                        help="Chunk duration in seconds (default: 60 = 1 minute)")
+    parser.add_argument("--chunk-duration", type=int, default=180,
+                        help="Chunk duration in seconds (default: 180 = 3 minutes)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps, ignoring existing checkpoints")
 
