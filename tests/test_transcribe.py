@@ -177,18 +177,40 @@ class TestExtractAudio:
         assert cmd[cmd.index("-ac") + 1] == "1"
         assert cmd[cmd.index("-ar") + 1] == "16000"
 
-    def test_no_speedup_no_atempo(self, tmp_path):
+    def test_no_speedup_no_silence_removal_omits_af(self, tmp_path):
         with patch("transcribe._run") as mock_run:
             transcribe.extract_audio(Path("input.mov"), tmp_path)
 
         cmd = mock_run.call_args[0][0]
+        assert "-af" not in cmd
+
+    def test_silence_removal_disabled_by_default(self, tmp_path):
+        with patch("transcribe._run") as mock_run:
+            transcribe.extract_audio(Path("input.mov"), tmp_path)
+
+        cmd = mock_run.call_args[0][0]
+        assert "silenceremove" not in " ".join(cmd)
+
+    def test_silence_removal_enabled(self, tmp_path):
+        with patch("transcribe._run") as mock_run:
+            transcribe.extract_audio(Path("input.mov"), tmp_path, remove_silence=True)
+
+        cmd = mock_run.call_args[0][0]
         af = cmd[cmd.index("-af") + 1]
-        assert "atempo" not in af
         assert "silenceremove" in af
 
     def test_speedup_prepends_atempo(self, tmp_path):
         with patch("transcribe._run") as mock_run:
             transcribe.extract_audio(Path("input.mov"), tmp_path, speedup=1.2)
+
+        cmd = mock_run.call_args[0][0]
+        af = cmd[cmd.index("-af") + 1]
+        assert af.startswith("atempo=1.2")
+        assert "silenceremove" not in af
+
+    def test_speedup_with_silence_removal(self, tmp_path):
+        with patch("transcribe._run") as mock_run:
+            transcribe.extract_audio(Path("input.mov"), tmp_path, speedup=1.2, remove_silence=True)
 
         cmd = mock_run.call_args[0][0]
         af = cmd[cmd.index("-af") + 1]

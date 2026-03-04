@@ -54,6 +54,7 @@ class PipelineConfig:
         output_dir:     Where to write outputs; defaults to {input_stem}_output next to input.
         speedup:        atempo speedup factor applied before chunking (None = disabled).
         chunk_duration: Length of each audio chunk in seconds (default 180 = 3 min).
+        remove_silence: Remove silence from audio before chunking (faster but SRT timestamps won't match original video).
         force:          Re-run all steps even if checkpoints already exist.
     """
     input: Path
@@ -62,6 +63,7 @@ class PipelineConfig:
     output_dir: Path | None = None
     speedup: float | None = None
     chunk_duration: int = 180
+    remove_silence: bool = False
     force: bool = False
 
 
@@ -128,11 +130,14 @@ def extract_audio(
     video_path: Path,
     output_dir: Path,
     speedup: float | None = None,
+    remove_silence: bool = False,
     force: bool = False,
 ) -> Path:
     """
-    Extract audio from video to mono 16kHz WAV with silence removal.
+    Extract audio from video to mono 16kHz WAV.
     Applies optional speedup (atempo filter) if requested.
+    Applies silence removal only when remove_silence=True; disabling it
+    preserves the original video timeline so SRT timestamps stay in sync.
 
     Skips if audio.wav already exists (unless force=True).
     """
@@ -149,16 +154,18 @@ def extract_audio(
     if speedup and speedup != 1.0:
         logging.info("[EXTRACT] Speedup: %.2fx (atempo filter)", speedup)
         filters.append(f"atempo={speedup}")
-    filters.append("silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB")
+    if remove_silence:
+        filters.append("silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB")
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-ac", "1",           # mono
         "-ar", "16000",       # 16kHz
-        "-af", ",".join(filters),
-        str(audio_path),
     ]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd.append(str(audio_path))
     _run(cmd)
     logging.info("[EXTRACT] Done → %s", audio_path)
     return audio_path
@@ -393,6 +400,7 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     logging.info("[PIPELINE] Language:     %s", config.language)
     logging.info("[PIPELINE] Chunk dur:    %ds", config.chunk_duration)
     logging.info("[PIPELINE] Speedup:      %s", f"{config.speedup}x" if config.speedup else "disabled")
+    logging.info("[PIPELINE] Silence rem:  %s", "enabled" if config.remove_silence else "disabled (timestamps match original video)")
     logging.info("[PIPELINE] Force re-run: %s", config.force)
     logging.info("=" * 60)
 
@@ -400,6 +408,7 @@ def run_pipeline(config: PipelineConfig, backend: TranscribeBackend | None = Non
     audio_path = extract_audio(
         video_path, output_dir,
         speedup=config.speedup,
+        remove_silence=config.remove_silence,
         force=config.force,
     )
 
@@ -513,6 +522,8 @@ examples:
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
     parser.add_argument("--chunk-duration", type=int, default=180,
                         help="Chunk duration in seconds (default: 180 = 3 minutes)")
+    parser.add_argument("--remove-silence", action="store_true", default=False,
+                        help="Remove silence before transcription (faster but SRT timestamps won't match original video)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run all steps, ignoring existing checkpoints")
 
@@ -527,6 +538,7 @@ examples:
         output_dir=Path(args.output_dir) if args.output_dir else None,
         speedup=args.speedup,
         chunk_duration=args.chunk_duration,
+        remove_silence=args.remove_silence,
         force=args.force,
     )
     run_pipeline(config)
