@@ -12,7 +12,7 @@ Focuses on:
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -39,21 +39,6 @@ class TestFmtSrtTime:
 
     def test_milliseconds(self):
         assert transcribe._fmt_srt_time(1.123) == "00:00:01,123"
-
-
-# ---------------------------------------------------------------------------
-# Pure function: _fmt_duration
-# ---------------------------------------------------------------------------
-
-class TestFmtDuration:
-    def test_seconds(self):
-        assert transcribe._fmt_duration(11.4) == "11.4s"
-
-    def test_exactly_one_minute(self):
-        assert transcribe._fmt_duration(60.0) == "1m0s"
-
-    def test_minutes_and_seconds(self):
-        assert transcribe._fmt_duration(200.0) == "3m20s"
 
 
 # ---------------------------------------------------------------------------
@@ -242,55 +227,28 @@ class TestChunkAudio:
 # _transcribe_one
 # ---------------------------------------------------------------------------
 
+MODEL_REPO = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx"
+
+
 class TestTranscribeOne:
-    def _make_segment(self, start, end, text):
-        seg = MagicMock()
-        seg.start = start
-        seg.end = end
-        seg.text = text
-        return seg
-
-    def _make_info(self, language="he", prob=0.99):
-        info = MagicMock()
-        info.language = language
-        info.language_probability = prob
-        return info
-
-    def _inject_model(self, mock_model):
-        """Inject mock into module-level _model_store and return cleanup callable."""
-        original = dict(transcribe._model_store)
-        transcribe._model_store["model"] = mock_model
-        def cleanup():
-            transcribe._model_store.clear()
-            transcribe._model_store.update(original)
-        return cleanup
-
     def test_skips_if_json_exists(self, tmp_path):
         output_json = tmp_path / "chunk_000.json"
         output_json.touch()
-        mock_model = MagicMock()
-        cleanup = self._inject_model(mock_model)
-        try:
-            transcribe._transcribe_one((
-                str(tmp_path / "chunk_000.wav"), 0, str(output_json), "he"
-            ))
-            mock_model.transcribe.assert_not_called()
-        finally:
-            cleanup()
+        with patch("mlx_whisper.transcribe") as mock_t:
+            transcribe._transcribe_one(
+                str(tmp_path / "chunk_000.wav"), 0, str(output_json), "he", MODEL_REPO
+            )
+            mock_t.assert_not_called()
 
     def test_writes_json_checkpoint(self, tmp_path):
         chunk_wav = tmp_path / "chunk_000.wav"
         chunk_wav.touch()
         output_json = tmp_path / "chunk_000.json"
 
-        segments = [self._make_segment(0.0, 1.5, " שלום ")]
-        mock_model = MagicMock()
-        mock_model.transcribe.return_value = (iter(segments), self._make_info())
-        cleanup = self._inject_model(mock_model)
-        try:
-            transcribe._transcribe_one((str(chunk_wav), 0, str(output_json), "he"))
-        finally:
-            cleanup()
+        with patch("mlx_whisper.transcribe", return_value={"segments": [
+            {"start": 0.0, "end": 1.5, "text": " שלום "}
+        ]}):
+            transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", MODEL_REPO)
 
         assert output_json.exists()
         data = json.loads(output_json.read_text(encoding="utf-8"))
@@ -301,14 +259,9 @@ class TestTranscribeOne:
         chunk_wav.touch()
         output_json = tmp_path / "chunk_000.json"
 
-        mock_model = MagicMock()
-        mock_model.transcribe.return_value = (iter([]), self._make_info())
-        cleanup = self._inject_model(mock_model)
-        try:
-            transcribe._transcribe_one((str(chunk_wav), 0, str(output_json), "he"))
-        finally:
-            cleanup()
+        with patch("mlx_whisper.transcribe", return_value={"segments": []}) as mock_t:
+            transcribe._transcribe_one(str(chunk_wav), 0, str(output_json), "he", MODEL_REPO)
 
-        mock_model.transcribe.assert_called_once_with(
-            str(chunk_wav), language="he", beam_size=5
+        mock_t.assert_called_once_with(
+            str(chunk_wav), path_or_hf_repo=MODEL_REPO, language="he"
         )

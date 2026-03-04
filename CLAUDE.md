@@ -2,25 +2,23 @@
 
 ## What this project does
 Fully local, offline transcription pipeline for iPhone video recordings (.mov, .mp4).
-Extracts audio → chunks → transcribes in parallel → outputs `transcript.txt` + `transcript.srt`.
+Extracts audio → chunks → transcribes sequentially → outputs `transcript.txt` + `transcript.srt`.
 
 ## Stack
-- **faster-whisper** (CTranslate2 backend) — default model `large-v3`, Hebrew (`he`)
+- **mlx-whisper** (Apple Silicon GPU/Neural Engine) — default model `mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx` (Hebrew fine-tune)
 - **ffmpeg** — audio extraction, silence removal, chunking
-- **multiprocessing.Pool** — parallel transcription; model loaded once per worker via `initializer`
 
 ## Key design decisions
-- `device="cpu"`, `compute_type="int8"` — faster-whisper has no MPS support; int8 is optimal on Apple Silicon
-- Workers default to 2 — large-v3 is ~3GB RAM each; 2 workers = ~6GB, safe on M4
+- mlx-whisper uses Apple Silicon GPU/Neural Engine natively — no multiprocessing needed
+- Transcription is sequential; MLX handles parallelism internally on-chip
 - Silence removal on by default (`silenceremove` ffmpeg filter, threshold -45dB, 1.5s gaps)
 - Speedup off by default — opt-in via `--speedup FLOAT` (atempo filter)
-- `_model_store`, `_init_worker`, `_transcribe_one` are **module-level** — required for macOS `spawn` pickling
 - SRT timestamps use `ffprobe` per chunk for accuracy (silence removal makes chunk durations variable)
 
 ## File structure
 ```
 transcribe.py       ← entire pipeline in one file
-requirements.txt    ← faster-whisper>=1.0.0
+requirements.txt    ← mlx-whisper
 venv/               ← Python virtualenv (gitignored)
 ```
 
@@ -48,10 +46,9 @@ pip install -r requirements.txt
 source venv/bin/activate
 
 python transcribe.py input.mov                        # basic
-python transcribe.py input.mov --workers 4            # more parallelism
 python transcribe.py input.mov --speedup 1.1          # 10% faster audio
 python transcribe.py input.mov --force                # re-run all steps
-python transcribe.py input.mov --model medium         # lighter model
+python transcribe.py input.mov --model mlx-community/whisper-large-v3-mlx  # different model
 python transcribe.py input.mov --language en          # non-Hebrew
 ```
 
@@ -63,7 +60,3 @@ Each step checks if its output already exists and skips if so:
 - `transcript.txt` → skip merge
 
 Use `--force` to bypass all resume checks.
-
-## Stats output
-Each step is wrapped in `StepTimer` — prints wall time, CPU time, and CPU utilization at end.
-`RUSAGE_CHILDREN` is included so worker process CPU shows up correctly in transcription stats.

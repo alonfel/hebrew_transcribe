@@ -2,7 +2,7 @@
 """
 Hebrew transcription pipeline for iPhone videos.
 
-Runs fully locally using faster-whisper (large-v3) and ffmpeg.
+Runs fully locally using mlx-whisper (Apple Silicon GPU) and ffmpeg.
 
 Installation:
     brew install ffmpeg
@@ -10,7 +10,7 @@ Installation:
 
 Usage:
     python transcribe.py input_video.mov
-    python transcribe.py input_video.mov --workers 4 --speedup 1.1
+    python transcribe.py input_video.mov --speedup 1.1
     python transcribe.py input_video.mov --force          # re-run all steps
     python transcribe.py input_video.mov --output-dir ./out
 """
@@ -18,104 +18,32 @@ Usage:
 import argparse
 import json
 import logging
-import multiprocessing
-import resource
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-
-# ---------------------------------------------------------------------------
-# Step timer — tracks wall time and CPU time (including child processes)
-# ---------------------------------------------------------------------------
-
-class StepTimer:
-    """Context manager that measures wall time and CPU time for a pipeline step."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.wall: float = 0.0
-        self.cpu: float = 0.0
-
-    def __enter__(self) -> "StepTimer":
-        self._wall_start = time.perf_counter()
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self._cpu_start = ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime
-        return self
-
-    def __exit__(self, *_) -> None:
-        self.wall = time.perf_counter() - self._wall_start
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu_end = ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime
-        self.cpu = cpu_end - self._cpu_start
-        cpu_pct = (self.cpu / self.wall * 100) if self.wall > 0 else 0.0
-        logging.info(
-            "[STATS] %-18s  wall=%-8s  cpu=%-8s  cpu_util=%3.0f%%",
-            self.name, _fmt_duration(self.wall), _fmt_duration(self.cpu), cpu_pct,
-        )
+import mlx_whisper
 
 
-def _fmt_duration(secs: float) -> str:
-    """Format a duration in seconds as a human-readable string."""
-    if secs < 60:
-        return f"{secs:.1f}s"
-    m, s = divmod(secs, 60)
-    return f"{int(m)}m{s:.0f}s"
-
-
-# ---------------------------------------------------------------------------
-# Globals — must be module-level for multiprocessing pickling (macOS spawn)
-# ---------------------------------------------------------------------------
-
-_model_store: dict = {}
-
-
-def _init_worker(model_name: str, compute_type: str) -> None:
-    """Load WhisperModel once per worker process (called by Pool initializer)."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-    )
-    logging.info("[WORKER] Loading model '%s' (device=cpu, compute_type=%s) ...", model_name, compute_type)
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        logging.error("[WORKER] faster-whisper not installed. Run: pip install faster-whisper")
-        sys.exit(1)
-    _model_store["model"] = WhisperModel(model_name, device="cpu", compute_type=compute_type)
-    logging.info("[WORKER] Model ready")
-
-
-def _transcribe_one(args: tuple) -> None:
+def _transcribe_one(chunk_path: str, chunk_idx: int, output_json: str, language: str, model_repo: str) -> None:
     """
     Transcribe a single chunk and save the result to a JSON checkpoint file.
     Skips if the checkpoint already exists (resume support).
     """
-    chunk_path_str, chunk_idx, output_json_str, language = args
-    output_json = Path(output_json_str)
+    out = Path(output_json)
 
-    if output_json.exists():
+    if out.exists():
         logging.info("[TRANSCRIBE] chunk_%03d — skipping (checkpoint exists)", chunk_idx)
         return
 
-    chunk_path = Path(chunk_path_str)
-    logging.info("[TRANSCRIBE] chunk_%03d — transcribing %s ...", chunk_idx, chunk_path.name)
+    logging.info("[TRANSCRIBE] chunk_%03d — transcribing %s ...", chunk_idx, Path(chunk_path).name)
 
-    model = _model_store["model"]
-    segments, info = model.transcribe(str(chunk_path), language=language, beam_size=5)
+    result = mlx_whisper.transcribe(chunk_path, path_or_hf_repo=model_repo, language=language)
 
-    result = [(s.start, s.end, s.text.strip()) for s in segments]
-    output_json.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    segs = [(s["start"], s["end"], s["text"].strip()) for s in result["segments"]]
+    out.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
 
-    logging.info(
-        "[TRANSCRIBE] chunk_%03d — done (%d segments, detected lang=%s, prob=%.2f)",
-        chunk_idx, len(result), info.language, info.language_probability,
-    )
+    logging.info("[TRANSCRIBE] chunk_%03d — done (%d segments)", chunk_idx, len(segs))
 
 
 # ---------------------------------------------------------------------------
@@ -204,24 +132,21 @@ def chunk_audio(
 
 
 # ---------------------------------------------------------------------------
-# Pipeline step 3: Transcribe chunks in parallel
+# Pipeline step 3: Transcribe chunks sequentially (MLX uses GPU internally)
 # ---------------------------------------------------------------------------
 
 def transcribe_chunks(
     chunk_paths: list[Path],
     chunks_dir: Path,
-    workers: int = 2,
-    model_name: str = "large-v3",
+    model_name: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
     language: str = "he",
     force: bool = False,
 ) -> None:
     """
-    Transcribe all chunks in parallel using a multiprocessing Pool.
+    Transcribe all chunks using mlx-whisper (Apple Silicon GPU/Neural Engine).
 
-    Each worker loads the model once (via initializer). Each completed chunk
-    is saved to chunk_NNN.json immediately as a resume checkpoint.
-
-    Skips chunks whose .json already exists (unless force=True).
+    Each completed chunk is saved to chunk_NNN.json immediately as a resume
+    checkpoint. Skips chunks whose .json already exists (unless force=True).
     """
     if force:
         removed = 0
@@ -244,23 +169,11 @@ def transcribe_chunks(
         logging.info("[TRANSCRIBE] All chunks already transcribed — skipping")
         return
 
-    args_list = [
-        (str(p), idx, str(chunks_dir / f"{p.stem}.json"), language)
-        for idx, p in enumerate(chunk_paths)
-    ]
+    logging.info("[TRANSCRIBE] Using model: %s", model_name)
 
-    effective_workers = min(workers, remaining)
-    logging.info(
-        "[TRANSCRIBE] Spawning pool of %d workers (model=%s, device=cpu, compute_type=int8)",
-        effective_workers, model_name,
-    )
-
-    with multiprocessing.Pool(
-        processes=effective_workers,
-        initializer=_init_worker,
-        initargs=(model_name, "int8"),
-    ) as pool:
-        pool.map(_transcribe_one, args_list)
+    for idx, chunk_path in enumerate(chunk_paths):
+        output_json = chunks_dir / f"{chunk_path.stem}.json"
+        _transcribe_one(str(chunk_path), idx, str(output_json), language, model_name)
 
     done_after = sum(1 for p in chunk_paths if (chunks_dir / f"{p.stem}.json").exists())
     logging.info("[TRANSCRIBE] Done — %d/%d chunks transcribed", done_after, total)
@@ -361,67 +274,40 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logging.info("[PIPELINE] Output dir:   %s", output_dir)
     logging.info("[PIPELINE] Model:        %s", args.model)
     logging.info("[PIPELINE] Language:     %s", args.language)
-    logging.info("[PIPELINE] Workers:      %d", args.workers)
     logging.info("[PIPELINE] Chunk dur:    %ds", args.chunk_duration)
     logging.info("[PIPELINE] Speedup:      %s", f"{args.speedup}x" if args.speedup else "disabled")
     logging.info("[PIPELINE] Force re-run: %s", args.force)
     logging.info("=" * 60)
 
-    timers: list[StepTimer] = []
-
     # Step 1: Extract audio
-    with StepTimer("extract_audio") as t:
-        audio_path = extract_audio(
-            video_path, output_dir,
-            speedup=args.speedup,
-            force=args.force,
-        )
-    timers.append(t)
+    audio_path = extract_audio(
+        video_path, output_dir,
+        speedup=args.speedup,
+        force=args.force,
+    )
 
     # Step 2: Chunk audio
-    with StepTimer("chunk_audio") as t:
-        chunk_paths = chunk_audio(
-            audio_path, chunks_dir,
-            chunk_duration=args.chunk_duration,
-            force=args.force,
-        )
-    timers.append(t)
+    chunk_paths = chunk_audio(
+        audio_path, chunks_dir,
+        chunk_duration=args.chunk_duration,
+        force=args.force,
+    )
     if not chunk_paths:
         logging.error("[PIPELINE] No chunks produced — aborting")
         sys.exit(1)
 
-    # Step 3: Transcribe chunks in parallel
-    with StepTimer("transcribe_chunks") as t:
-        transcribe_chunks(
-            chunk_paths, chunks_dir,
-            workers=args.workers,
-            model_name=args.model,
-            language=args.language,
-            force=args.force,
-        )
-    timers.append(t)
+    # Step 3: Transcribe chunks
+    transcribe_chunks(
+        chunk_paths, chunks_dir,
+        model_name=args.model,
+        language=args.language,
+        force=args.force,
+    )
 
     # Step 4: Merge into final transcript
-    with StepTimer("merge_results") as t:
-        merge_results(chunks_dir, output_dir, force=args.force)
-    timers.append(t)
+    merge_results(chunks_dir, output_dir, force=args.force)
 
-    # Summary table
-    total_wall = sum(t.wall for t in timers)
-    total_cpu = sum(t.cpu for t in timers)
-    total_pct = (total_cpu / total_wall * 100) if total_wall > 0 else 0.0
-    sep = "-" * 58
-    logging.info(sep)
-    logging.info("[STATS] %-18s  %-10s  %-10s  %s", "Step", "Wall time", "CPU time", "CPU util")
-    logging.info("[STATS] %s", sep)
-    for timer in timers:
-        pct = (timer.cpu / timer.wall * 100) if timer.wall > 0 else 0.0
-        logging.info("[STATS] %-18s  %-10s  %-10s  %3.0f%%",
-                     timer.name, _fmt_duration(timer.wall), _fmt_duration(timer.cpu), pct)
-    logging.info("[STATS] %s", sep)
-    logging.info("[STATS] %-18s  %-10s  %-10s  %3.0f%%",
-                 "TOTAL", _fmt_duration(total_wall), _fmt_duration(total_cpu), total_pct)
-    logging.info(sep)
+    logging.info("=" * 60)
     logging.info("[PIPELINE] All done!")
     logging.info("[PIPELINE] Transcript: %s", output_dir / "transcript.txt")
     logging.info("[PIPELINE] Subtitles:  %s", output_dir / "transcript.srt")
@@ -484,17 +370,16 @@ def main() -> None:
         epilog="""
 examples:
   python transcribe.py lecture.mov
-  python transcribe.py lecture.mov --workers 4 --speedup 1.1
+  python transcribe.py lecture.mov --speedup 1.1
   python transcribe.py lecture.mov --output-dir ./output --force
-  python transcribe.py lecture.mov --model medium --language en
+  python transcribe.py lecture.mov --model mlx-community/whisper-large-v3-mlx --language en
         """,
     )
     parser.add_argument("input", help="Path to input video file (e.g. video.mov, video.mp4)")
     parser.add_argument("--output-dir", help="Output directory (default: {input_stem}_output next to input)")
-    parser.add_argument("--model", default="large-v3", help="Whisper model name (default: large-v3)")
+    parser.add_argument("--model", default="mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx",
+                        help="HuggingFace repo for mlx-whisper model (default: ivrit-ai-whisper-large-v3-turbo-mlx)")
     parser.add_argument("--language", default="he", help="Language code (default: he for Hebrew)")
-    parser.add_argument("--workers", type=int, default=2,
-                        help="Parallel transcription workers (default: 2; large-v3 uses ~3GB RAM each)")
     parser.add_argument("--speedup", type=float, default=None,
                         help="Audio speedup factor via atempo filter, e.g. 1.1 (default: disabled)")
     parser.add_argument("--chunk-duration", type=int, default=180,
