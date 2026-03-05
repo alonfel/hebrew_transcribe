@@ -13,7 +13,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from ui import runner
+import runner
 
 # ---------------------------------------------------------------------------
 # Page config
