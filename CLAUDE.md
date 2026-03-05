@@ -7,6 +7,7 @@ Extracts audio → chunks → transcribes sequentially → outputs `transcript.t
 ## Stack
 - **mlx-whisper** (Apple Silicon GPU/Neural Engine) — model auto-selected by language (see below)
 - **ffmpeg** — audio extraction, silence removal, chunking
+- **Streamlit** — local web UI (optional; CLI works independently)
 
 ## Supported languages & models
 
@@ -26,9 +27,13 @@ The model is auto-selected based on `--language`. Override with `--model` if nee
 
 ## File structure
 ```
-transcribe.py           ← entire pipeline in one file
-requirements.txt        ← mlx-whisper
+transcribe.py           ← entire pipeline in one file (CLI entry point)
+requirements.txt        ← mlx-whisper, streamlit
 pytest.ini              ← pytest config; integration/ excluded from default run
+ui/
+  app.py                ← Streamlit web UI
+  runner.py             ← subprocess bridge (builds CLI command, streams output)
+  __init__.py
 tests/
   conftest.py           ← stubs mlx_whisper for unit tests (no real model needed)
   test_transcribe.py    ← 39 unit tests (fast, no external deps)
@@ -57,8 +62,16 @@ pip install -r requirements.txt
 ```
 
 ## Running
+
+### Web UI (recommended)
 ```bash
-# Activate venv first
+source venv/bin/activate
+streamlit run ui/app.py
+```
+Opens at http://localhost:8501. Browse for a file, pick options, click Transcribe — logs stream live and a transcript preview appears on completion.
+
+### CLI
+```bash
 source venv/bin/activate
 
 # Hebrew (default) — uses ivrit-ai Hebrew fine-tune
@@ -71,8 +84,11 @@ python transcribe.py input.mov --language en
 python transcribe.py input.mov --speedup 1.1          # 10% faster audio
 python transcribe.py input.mov --force                # re-run all steps
 python transcribe.py input.mov --model mlx-community/whisper-large-v3-turbo --language en  # explicit model
-python transcribe.py input.mov --remove-silence   # faster but SRT timestamps won't match original video
+python transcribe.py input.mov --remove-silence       # faster but SRT timestamps won't match original video
 ```
+
+## UI architecture
+`ui/runner.py` wraps the CLI as a subprocess and exposes a `stream_transcription()` generator — keeping `transcribe.py` untouched. The Streamlit app (`ui/app.py`) consumes that generator. A future HTML frontend would import the same `runner.py` via a Flask/SSE server with zero changes to the core logic.
 
 ## Resume behavior
 Each step checks if its output already exists and skips if so:
